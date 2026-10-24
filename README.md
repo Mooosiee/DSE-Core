@@ -206,4 +206,3 @@ While the current prototype handles deterministic scaling well, the following ar
 This platform demonstrates that moving hashing, deduplication, and transfer orchestration to the client enables a scalable, memory-bounded distributed storage architecture while maintaining strong security guarantees through a Zero-Trust protocol.
 
 ---
-*Created by Juixe7 (Avadh Khandelwal)*
