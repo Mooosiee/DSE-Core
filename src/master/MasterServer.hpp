@@ -1,0 +1,478 @@
+#pragma once
+#include "../common/httplib.h"
+#include "../common/json.hpp"
+#include "../common/crypto.hpp"
+#include "IMetadataRepository.hpp"
+#include <string>
+#include <vector>
+#include <iostream>
+#include <cstdlib>
+
+class MasterServer
+{
+private:
+    httplib::Server svr;
+    IMetadataRepository *db;
+
+    std::string cluster_secret;
+    std::string session_secret;
+
+    // Helper utility to parse the Bearer Token and authorize the transaction thread-safely.
+    bool AuthenticateUser(const httplib::Request &req, httplib::Response &res, int &user_id)
+    {
+        if (!req.has_header("Authorization"))
+        {
+            res.status = 401;
+            res.set_content(R"({"error": "Unauthorized: Missing token"})", "application/json");
+            return false;
+        }
+        std::string auth_header = req.get_header_value("Authorization");
+        if (auth_header.rfind("Bearer ", 0) != 0)
+        {
+            res.status = 401;
+            res.set_content(R"({"error": "Unauthorized: Malformed token"})", "application/json");
+            return false;
+        }
+        std::string token = auth_header.substr(7);
+
+        // Invokes cryptographic verification helper in crypto.hpp [14]
+        if (!VerifySessionToken(token, session_secret, user_id))
+        {
+            res.status = 401;
+            res.set_content(R"({"error": "Unauthorized: Invalid or expired token"})", "application/json");
+            return false;
+        }
+        return true;
+    }
+
+    void RegisterRoutes(int node_port)
+    {
+        svr.Get("/", [this, node_port](const httplib::Request &req, httplib::Response &res)
+                { HandleHealthCheck(req, res, node_port); });
+
+        svr.Post("/auth/signup", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleSignup(req, res); });
+
+        svr.Post("/auth/login", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleLogin(req, res); });
+
+        svr.Post("/upload-init", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleUploadInit(req, res); });
+
+        svr.Post("/files/commit", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleCommit(req, res); });
+
+        // NEW: Endpoint providing data plane routing blueprints to authorized download clients.
+        svr.Get("/files/download-plan", [this](const httplib::Request &req, httplib::Response &res)
+                { HandleDownloadPlan(req, res); });
+
+        svr.Post("/heartbeat", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleHeartbeat(req, res); });
+
+        svr.Post("/admin/cluster/add", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleAddCluster(req, res); });
+
+        svr.Post("/admin/cluster/replace", [this](const httplib::Request &req, httplib::Response &res)
+                 { HandleReplaceCluster(req, res); });
+
+        svr.Get("/files/exists", [this](const httplib::Request &req, httplib::Response &res)
+                { HandleFileExists(req, res); });
+
+        svr.Delete("/files", [this](const httplib::Request &req, httplib::Response &res)
+                   { HandleDeleteFile(req, res); });
+    }
+
+    // --- ENDPOINT HANDLERS ---
+    // Inside ENDPOINT HANDLERS:
+    void HandleFileExists(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return;
+
+        if (!req.has_param("filename"))
+        {
+            res.status = 400;
+            return;
+        }
+
+        std::string filename = req.get_param_value("filename");
+        bool exists = this->db->FileExists(user_id, filename);
+
+        nlohmann::json response = {{"exists", exists}};
+        res.status = 200;
+        res.set_content(response.dump(), "application/json");
+    }
+
+    void HandleDeleteFile(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return;
+
+        if (!req.has_param("filename"))
+        {
+            res.status = 400;
+            return;
+        }
+
+        std::string filename = req.get_param_value("filename");
+
+        if (this->db->DeleteFile(user_id, filename))
+        {
+            res.status = 200;
+            res.set_content(R"({"status": "success", "message": "File deleted."})", "application/json");
+        }
+        else
+        {
+            res.status = 404;
+            res.set_content(R"({"error": "File not found"})", "application/json");
+        }
+    }
+    void HandleHealthCheck(const httplib::Request &req, httplib::Response &res, int node_port)
+    {
+        try
+        {
+            std::string db_version = this->db->GetDatabaseVersion();
+            std::string message = "Master Node OK. Port: " + std::to_string(node_port) + "\nDB: " + db_version;
+            res.set_content(message, "text/plain");
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+            res.set_content(R"({"error": "Database offline"})", "application/json");
+        }
+    }
+
+    void HandleSignup(const httplib::Request &req, httplib::Response &res)
+    {
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+            std::string email = json.at("email").get<std::string>();
+            std::string raw_password = json.at("password").get<std::string>();
+
+            std::string salt = GenerateSalt();
+            std::string hashed_password = HashPasswordPBKDF2(raw_password, salt);
+
+            if (this->db->CreateUser(email, hashed_password, salt))
+            {
+                res.status = 201;
+                res.set_content(R"({"status": "success"})", "application/json");
+            }
+            else
+            {
+                res.status = 409;
+                res.set_content(R"({"error": "Registration failed"})", "application/json");
+            }
+        }
+        catch (const nlohmann::json::exception &e)
+        {
+            res.status = 400;
+            res.set_content(R"({"error": "Invalid JSON payload"})", "application/json");
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+            res.set_content(R"({"error": "Internal server error"})", "application/json");
+        }
+    }
+
+    void HandleLogin(const httplib::Request &req, httplib::Response &res)
+    {
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+            std::string email = json.at("email").get<std::string>();
+            std::string password = json.at("password").get<std::string>();
+
+            UserRecord user = this->db->GetUserByEmail(email);
+            static const std::string dummy_salt = "00000000000000000000000000000000";
+
+            if (user.found)
+            {
+                std::string attempt_hash = HashPasswordPBKDF2(password, user.salt);
+
+                if (ConstantTimeEquals(attempt_hash, user.password_hash))
+                {
+                    std::string token = GenerateSessionToken(user.id, session_secret);
+                    nlohmann::json response = {{"status", "success"}, {"token", token}};
+                    res.set_content(response.dump(), "application/json");
+                    return;
+                }
+            }
+            else
+            {
+                HashPasswordPBKDF2(password, dummy_salt);
+            }
+
+            res.status = 401;
+            res.set_content(R"({"error": "Invalid credentials"})", "application/json");
+        }
+        catch (const nlohmann::json::exception &e)
+        {
+            res.status = 400;
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+        }
+    }
+
+    void HandleUploadInit(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return; // Validates JWT session token
+
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+            std::vector<std::string> client_hashes = json.at("hashes").get<std::vector<std::string>>();
+
+            std::vector<ChunkRoutingPlan> missing = this->db->FilterMissingChunks(client_hashes);
+
+            long long expiry = std::chrono::duration_cast<std::chrono::seconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count() +
+                               86400; // 24-hour TTL
+
+            nlohmann::json missing_json = nlohmann::json::array();
+            for (const auto &plan : missing)
+            {
+                nlohmann::json nodes_json = nlohmann::json::array();
+                for (const auto &node : plan.assigned_nodes)
+                {
+                    nodes_json.push_back({{"advertised_host", node.advertised_host}, {"advertised_port", node.advertised_port}});
+                }
+
+                // Generate Ticket
+                std::string ticket = hmac_sha256(plan.hash + std::to_string(expiry), cluster_secret);
+
+                missing_json.push_back({{"hash", plan.hash}, {"assigned_nodes", nodes_json}, {"upload_ticket", ticket}, {"ticket_expiry", expiry}});
+            }
+            nlohmann::json response = {
+                {"status", "success"},
+                {"missing_hashes", missing_json}};
+            res.set_content(response.dump(), "application/json");
+        }
+        catch (const nlohmann::json::exception &e)
+        {
+            res.status = 400;
+        }
+        catch (const std::runtime_error &e)
+        {
+            if (std::string(e.what()) == "CHUNK_LOCKED")
+            {
+                res.status = 423;
+                res.set_content(R"({"error": "Resource locked. Retry."})", "application/json");
+            }
+            else
+            {
+                res.status = 500;
+            }
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+        }
+    }
+
+    void HandleCommit(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return; // Extract verified user_id
+
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+            std::string filename = json.at("filename").get<std::string>();
+            // long long file_size = json.at("file_size").get<long long>();
+            std::vector<std::string> chunk_hashes = json.at("chunk_hashes").get<std::vector<std::string>>();
+            std::unordered_map<std::string, size_t> validated_sizes;
+
+            if (json.contains("receipts"))
+            {
+                for (auto &el : json["receipts"].items())
+                {
+                    std::string hash = el.key();
+                    std::string receipt = el.value()["receipt"].get<std::string>();
+                    size_t size = el.value()["size"].get<size_t>();
+
+                    std::string expected_receipt = hmac_sha256(hash + std::to_string(size) + "SUCCESS", cluster_secret);
+                    if (receipt != expected_receipt)
+                        throw std::runtime_error("INVALID_RECEIPT");
+
+                    validated_sizes[hash] = size;
+                }
+            }
+            // Commits file bound strictly to the calling user_id to enforce multi-tenancy
+            this->db->CommitFile(user_id, filename, chunk_hashes, validated_sizes);
+
+            res.status = 200;
+            res.set_content(R"({"status": "success"})", "application/json");
+        }
+        catch (const nlohmann::json::exception &e)
+        {
+            res.status = 400;
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+        }
+    }
+
+    void HandleDownloadPlan(const httplib::Request &req, httplib::Response &res)
+    {
+        int user_id = 0;
+        if (!AuthenticateUser(req, res, user_id))
+            return;
+        std::cout << "[DEBUG] Download authenticated as user_id="
+                  << user_id << "\n";
+        if (!req.has_param("filename"))
+        {
+            res.status = 400;
+            res.set_content(R"({"error": "Missing filename parameter"})", "application/json");
+            return;
+        }
+        std::string filename = req.get_param_value("filename");
+        std::cout << "[DEBUG] Download requested filename=["
+                  << filename << "]\n";
+        try
+        {
+            FileDownloadManifest manifest = this->db->GetDownloadPlan(user_id, filename);
+
+            nlohmann::json chunks_json = nlohmann::json::array();
+            for (const auto &plan : manifest.plans)
+            {
+                nlohmann::json nodes_json = nlohmann::json::array();
+                for (const auto &node : plan.assigned_nodes)
+                {
+                    nodes_json.push_back({{"advertised_host", node.advertised_host},
+                                          {"advertised_port", node.advertised_port}});
+                }
+                chunks_json.push_back({{"hash", plan.hash},
+                                       {"assigned_nodes", nodes_json}});
+            }
+
+            nlohmann::json response = {
+                {"status", "success"},
+                {"file_size", manifest.file_size},
+                {"chunks", chunks_json}};
+
+            res.status = 200;
+            res.set_content(response.dump(), "application/json");
+        }
+        catch (const std::runtime_error &e)
+        {
+            std::cerr << "[DOWNLOAD ERROR] " << e.what() << "\n";
+
+            res.status = 404;
+            res.set_content(
+                R"({"error": "File not found or access denied"})",
+                "application/json");
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[DOWNLOAD INTERNAL ERROR] " << e.what() << "\n";
+
+            res.status = 500;
+            res.set_content(
+                R"({"error": "Internal server error"})",
+                "application/json");
+        }
+    }
+
+    void HandleHeartbeat(const httplib::Request &req, httplib::Response &res)
+    {
+        if (!req.has_header("X-Cluster-Secret") ||
+            req.get_header_value("X-Cluster-Secret") != cluster_secret)
+        {
+            res.status = 401;
+            return;
+        }
+
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+
+            this->db->RegisterWorker(
+                json.at("internal_host").get<std::string>(),
+                json.at("internal_port").get<int>(),
+                json.at("advertised_host").get<std::string>(),
+                json.at("advertised_port").get<int>(),
+                json.at("free_space").get<long long>());
+
+            res.status = 200;
+        }
+        catch (const nlohmann::json::exception &e)
+        {
+            res.status = 400;
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+        }
+    }
+
+    void HandleAddCluster(const httplib::Request &req, httplib::Response &res)
+    {
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+            std::string cluster_name = json.at("cluster_name").get<std::string>();
+            std::vector<int> active_node_ids = json.at("active_node_ids").get<std::vector<int>>();
+
+            this->db->AddCluster(cluster_name, active_node_ids);
+
+            res.status = 200;
+            res.set_content(R"({"status": "Load distributed successfully."})", "application/json");
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+            res.set_content(R"({"error": "Failed to integrate cluster"})", "application/json");
+        }
+    }
+
+    void HandleReplaceCluster(const httplib::Request &req, httplib::Response &res)
+    {
+        try
+        {
+            auto json = nlohmann::json::parse(req.body);
+            int cluster_id = json.at("cluster_id").get<int>();
+            std::vector<int> new_worker_ids = json.at("new_worker_ids").get<std::vector<int>>();
+
+            this->db->ReplaceCluster(cluster_id, new_worker_ids);
+
+            nlohmann::json response = {
+                {"status", "success"},
+                {"message", "Cluster nodes replaced in-place. Former nodes marked READ_ONLY."}};
+
+            res.status = 200;
+            res.set_content(response.dump(), "application/json");
+        }
+        catch (const std::exception &e)
+        {
+            res.status = 500;
+            res.set_content(R"({"error": "Failed to execute in-place cluster replacement"})", "application/json");
+        }
+    }
+
+public:
+    MasterServer(int node_port, IMetadataRepository *repo, const std::string &cluster_secret, const std::string &session_secret) : db(repo), cluster_secret(cluster_secret), session_secret(session_secret)
+    {
+        RegisterRoutes(node_port);
+    }
+
+    void Listen(int port)
+    {
+        svr.listen("0.0.0.0", port);
+    }
+
+    void Stop()
+    {
+        svr.stop();
+    }
+};

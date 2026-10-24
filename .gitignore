@@ -1,0 +1,31 @@
+# Compiled Windows binaries
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# CMake and build directories
+build/
+out/
+.cmake/
+CMakeCache.txt
+CMakeFiles/
+
+# IDE configurations
+.vscode/
+.vs/
+*.sln
+*.vcxproj
+
+# Local database volumes & runtime state
+pgdata/
+data/
+.dse_client/
+*.log
+__pycache__/
+*.tmp
+
+# Documentation drafts & PDFs
+*.pdf
+dss_report*.pdf
